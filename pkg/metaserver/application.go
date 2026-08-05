@@ -22,7 +22,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"time"
+	"unsafe"
 
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metainternalversion "k8s.io/apimachinery/pkg/apis/meta/internalversion"
@@ -52,6 +54,9 @@ type Application struct {
 	Subresource string
 
 	// The following field defines the Application response result
+	// mu protects Status, Reason, Error, RespBody, ctx, and cancel
+	// from concurrent reads and writes across goroutines.
+	mu       *sync.RWMutex
 	RespBody []byte
 	Status   ApplicationStatus
 	Reason   string // why in this status
@@ -65,6 +70,39 @@ type Application struct {
 	countLock *sync.Mutex
 	// Timestamp record the last closing time of application, only make sense when count == 0
 	Timestamp time.Time
+}
+
+func (a *Application) ensureInit() {
+	if a.mu == nil {
+		newMu := &sync.RWMutex{}
+		atomic.CompareAndSwapPointer((*unsafe.Pointer)(unsafe.Pointer(&a.mu)), nil, unsafe.Pointer(newMu))
+	}
+	if a.countLock == nil {
+		newLock := &sync.Mutex{}
+		atomic.CompareAndSwapPointer((*unsafe.Pointer)(unsafe.Pointer(&a.countLock)), nil, unsafe.Pointer(newLock))
+	}
+}
+
+func (a *Application) lock() {
+	a.ensureInit()
+	a.mu.Lock()
+}
+
+func (a *Application) unlock() {
+	if a.mu != nil {
+		a.mu.Unlock()
+	}
+}
+
+func (a *Application) rLock() {
+	a.ensureInit()
+	a.mu.RLock()
+}
+
+func (a *Application) rUnlock() {
+	if a.mu != nil {
+		a.mu.RUnlock()
+	}
 }
 
 func NewApplication(ctx context.Context, key string, verb ApplicationVerb, nodename, subresource string, option interface{}, reqBody interface{}) (*Application, error) {
@@ -86,6 +124,7 @@ func NewApplication(ctx context.Context, key string, verb ApplicationVerb, noden
 		Status:      PreApplying,
 		Option:      ToBytes(option),
 		ReqBody:     ToBytes(reqBody),
+		mu:          &sync.RWMutex{},
 		ctx:         ctx2,
 		cancel:      cancel,
 		count:       0,
@@ -111,6 +150,8 @@ func (a *Application) Identifier() string {
 }
 
 func (a *Application) String() string {
+	a.rLock()
+	defer a.rUnlock()
 	return fmt.Sprintf("(NodeName=%v;Key=%v;Verb=%v;Status=%v;Reason=%v)", a.Nodename, a.Key, a.Verb, a.Status, a.Reason)
 }
 
@@ -119,6 +160,8 @@ func (a *Application) ReqContent() interface{} {
 }
 
 func (a *Application) RespContent() interface{} {
+	a.rLock()
+	defer a.rUnlock()
 	return a.RespBody
 }
 
@@ -140,7 +183,10 @@ func (a *Application) ReqBodyTo(i interface{}) error {
 }
 
 func (a *Application) RespBodyTo(i interface{}) error {
-	err := json.Unmarshal(a.RespBody, i)
+	a.rLock()
+	body := a.RespBody
+	a.rUnlock()
+	err := json.Unmarshal(body, i)
 	if err != nil {
 		return fmt.Errorf("failed to parse RespBody bytes, %v", err)
 	}
@@ -158,38 +204,125 @@ func (a *Application) Namespace() string {
 }
 
 func (a *Application) Cancel() {
+	a.lock()
+	defer a.unlock()
 	if a.cancel != nil {
 		a.cancel()
 	}
 }
 
 func (a *Application) GetStatus() ApplicationStatus {
+	a.rLock()
+	defer a.rUnlock()
 	return a.Status
+}
+
+// SetStatus atomically updates the application status under the write lock.
+func (a *Application) SetStatus(s ApplicationStatus) {
+	a.lock()
+	defer a.unlock()
+	a.Status = s
+}
+
+// SetReason atomically updates the application Reason field under the write lock.
+func (a *Application) SetReason(reason string) {
+	a.lock()
+	defer a.unlock()
+	a.Reason = reason
+}
+
+// GetReason atomically reads the application Reason field.
+func (a *Application) GetReason() string {
+	a.rLock()
+	defer a.rUnlock()
+	return a.Reason
+}
+
+// GetError atomically reads the application Error field.
+func (a *Application) GetError() apierrors.StatusError {
+	a.rLock()
+	defer a.rUnlock()
+	return a.Error
+}
+
+// TryStartApplying attempts to start applying an application in PreApplying state.
+// Under a write lock, it atomically transitions Status from PreApplying to InApplying.
+// Returns true if the transition succeeded and caller should spawn doApply goroutine.
+func (a *Application) TryStartApplying() bool {
+	a.lock()
+	defer a.unlock()
+	if a.Status == PreApplying {
+		a.Status = InApplying
+		return true
+	}
+	return false
+}
+
+// TryResetAndStartApplying attempts to reset and restart an application in Completed state.
+// Under a single write lock, it cancels the old context, creates a new context,
+// clears Reason and RespBody, and atomically transitions Status directly to InApplying.
+// Returns true if the transition succeeded and caller should spawn doApply goroutine.
+func (a *Application) TryResetAndStartApplying() bool {
+	a.lock()
+	defer a.unlock()
+	if a.Status == Completed {
+		if a.ctx != nil && a.cancel != nil {
+			a.cancel()
+		}
+		a.ctx, a.cancel = context.WithCancel(beehiveContext.GetContext())
+		a.Reason = ""
+		a.RespBody = []byte{}
+		a.Status = InApplying
+		return true
+	}
+	return false
+}
+
+// UpdateFromResponse atomically applies all response fields from a cloud reply.
+func (a *Application) UpdateFromResponse(resp *Application) {
+	a.lock()
+	defer a.unlock()
+	a.Status = resp.Status
+	a.Reason = resp.Reason
+	a.Error = resp.Error
+	a.RespBody = resp.RespBody
 }
 
 // Wait the result of application after it is applied by application agent
 func (a *Application) Wait() {
-	if a.ctx != nil {
-		<-a.ctx.Done()
+	a.rLock()
+	ctx := a.ctx
+	a.rUnlock()
+	if ctx != nil {
+		<-ctx.Done()
 	}
 }
 
+// Reset prepares the application for reuse after it has reached Completed status.
+// It cancels the old context, creates a new one, clears transient response fields,
+// and transitions Status to PreApplying so that concurrent Apply calls do not
+// mistake the in-flight re-apply as already finished.
 func (a *Application) Reset() {
+	a.lock()
+	defer a.unlock()
 	if a.ctx != nil && a.cancel != nil {
 		a.cancel()
 	}
 	a.ctx, a.cancel = context.WithCancel(beehiveContext.GetContext())
 	a.Reason = ""
 	a.RespBody = []byte{}
+	a.Status = PreApplying
 }
 
 func (a *Application) Add() {
+	a.ensureInit()
 	a.countLock.Lock()
 	a.count++
 	a.countLock.Unlock()
 }
 
 func (a *Application) getCount() uint64 {
+	a.ensureInit()
 	a.countLock.Lock()
 	c := a.count
 	a.countLock.Unlock()
@@ -198,6 +331,7 @@ func (a *Application) getCount() uint64 {
 
 // Close must be called when applicant no longer using application
 func (a *Application) Close() {
+	a.ensureInit()
 	a.countLock.Lock()
 	defer a.countLock.Unlock()
 	if a.count == 0 {
@@ -207,11 +341,14 @@ func (a *Application) Close() {
 	a.Timestamp = time.Now()
 	a.count--
 	if a.count == 0 {
+		a.lock()
 		a.Status = Completed
+		a.unlock()
 	}
 }
 
 func (a *Application) LastCloseTime() time.Time {
+	a.ensureInit()
 	a.countLock.Lock()
 	defer a.countLock.Unlock()
 	if a.count == 0 && !a.Timestamp.IsZero() {
@@ -254,6 +391,8 @@ func MsgToApplication(msg model.Message) (*Application, error) {
 		nodeID = app.Nodename
 	}
 	app.Nodename = nodeID
+	app.mu = &sync.RWMutex{}
+	app.countLock = &sync.Mutex{}
 	return app, nil
 }
 
@@ -269,6 +408,11 @@ func MsgToApplications(msg model.Message) (map[string]Application, error) {
 	err = json.Unmarshal(contentData, &applications)
 	if err != nil {
 		return nil, err
+	}
+	for k, app := range applications {
+		app.mu = &sync.RWMutex{}
+		app.countLock = &sync.Mutex{}
+		applications[k] = app
 	}
 	return applications, nil
 }
