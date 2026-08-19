@@ -70,30 +70,33 @@ type Application struct {
 	Timestamp time.Time
 }
 
+// lock, unlock, rLock, and rUnlock require mu to already be initialized.
+// Applications must be constructed via NewApplication, MsgToApplication, or
+// MsgToApplications, all of which initialize mu and countLock explicitly.
 func (a *Application) lock() {
-	if a.mu == nil {
-		a.mu = &sync.RWMutex{}
-	}
 	a.mu.Lock()
 }
 
 func (a *Application) unlock() {
-	if a.mu != nil {
-		a.mu.Unlock()
-	}
+	a.mu.Unlock()
 }
 
 func (a *Application) rLock() {
-	if a.mu == nil {
-		a.mu = &sync.RWMutex{}
-	}
 	a.mu.RLock()
 }
 
 func (a *Application) rUnlock() {
-	if a.mu != nil {
-		a.mu.RUnlock()
-	}
+	a.mu.RUnlock()
+}
+
+// NewApplicationForTest builds an Application for tests outside this package
+// that need to construct one via a struct literal, with mu and countLock
+// initialized. Production code must use NewApplication, MsgToApplication, or
+// MsgToApplications instead.
+func NewApplicationForTest(a Application) *Application {
+	a.mu = &sync.RWMutex{}
+	a.countLock = &sync.Mutex{}
+	return &a
 }
 
 func NewApplication(ctx context.Context, key string, verb ApplicationVerb, nodename, subresource string, option interface{}, reqBody interface{}) (*Application, error) {
@@ -275,18 +278,12 @@ func (a *Application) Reset() {
 }
 
 func (a *Application) Add() {
-	if a.countLock == nil {
-		a.countLock = &sync.Mutex{}
-	}
 	a.countLock.Lock()
 	a.count++
 	a.countLock.Unlock()
 }
 
 func (a *Application) getCount() uint64 {
-	if a.countLock == nil {
-		a.countLock = &sync.Mutex{}
-	}
 	a.countLock.Lock()
 	c := a.count
 	a.countLock.Unlock()
@@ -295,9 +292,6 @@ func (a *Application) getCount() uint64 {
 
 // Close must be called when applicant no longer using application
 func (a *Application) Close() {
-	if a.countLock == nil {
-		a.countLock = &sync.Mutex{}
-	}
 	a.countLock.Lock()
 	defer a.countLock.Unlock()
 	if a.count == 0 {
@@ -314,9 +308,6 @@ func (a *Application) Close() {
 }
 
 func (a *Application) LastCloseTime() time.Time {
-	if a.countLock == nil {
-		a.countLock = &sync.Mutex{}
-	}
 	a.countLock.Lock()
 	defer a.countLock.Unlock()
 	if a.count == 0 && !a.Timestamp.IsZero() {
@@ -376,6 +367,11 @@ func MsgToApplications(msg model.Message) (map[string]Application, error) {
 	err = json.Unmarshal(contentData, &applications)
 	if err != nil {
 		return nil, err
+	}
+	for k, app := range applications {
+		app.mu = &sync.RWMutex{}
+		app.countLock = &sync.Mutex{}
+		applications[k] = app
 	}
 	return applications, nil
 }
