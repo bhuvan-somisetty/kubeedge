@@ -144,6 +144,7 @@ func TestString(t *testing.T) {
 				Verb:     "GET",
 				Status:   "completed",
 				Reason:   "test reason one",
+				mu:       &sync.RWMutex{},
 			},
 			stdResult: "(NodeName=test-node-one;Key=group/version/resource/namespaces/name;Verb=GET;Status=completed;Reason=test reason one)",
 		},
@@ -154,6 +155,7 @@ func TestString(t *testing.T) {
 				Verb:     "POST",
 				Status:   "pending",
 				Reason:   "test reason two",
+				mu:       &sync.RWMutex{},
 			},
 			stdResult: "(NodeName=test-node-two;Key=group/version/resource/namespaces/name;Verb=POST;Status=pending;Reason=test reason two)",
 		},
@@ -200,18 +202,19 @@ func TestRespContent(t *testing.T) {
 		stdResult []byte
 	}{
 		{
-			app:       Application{RespBody: []byte(`{"test":"data"}`)},
+			app:       Application{RespBody: []byte(`{"test":"data"}`), mu: &sync.RWMutex{}},
 			stdResult: []byte(`{"test":"data"}`),
 		},
 		{
 			app: Application{
 				Nodename: "test-node",
 				Key:      "group/version/resource/namespaces/name",
+				mu:       &sync.RWMutex{},
 			},
 			stdResult: nil,
 		},
 		{
-			app:       Application{RespBody: nil},
+			app:       Application{RespBody: nil, mu: &sync.RWMutex{}},
 			stdResult: nil,
 		},
 	}
@@ -280,7 +283,7 @@ func TestRespBodyTo(t *testing.T) {
 		expected map[string]string
 	}{
 		{
-			app:      Application{RespBody: []byte(`{"test-key":"test-value"}`)},
+			app:      Application{RespBody: []byte(`{"test-key":"test-value"}`), mu: &sync.RWMutex{}},
 			expected: map[string]string{"test-key": "test-value"},
 		},
 	}
@@ -293,7 +296,7 @@ func TestRespBodyTo(t *testing.T) {
 	}
 
 	// Test error case
-	app := Application{RespBody: []byte(`{invalid-json}`)}
+	app := Application{RespBody: []byte(`{invalid-json}`), mu: &sync.RWMutex{}}
 	var result map[string]string
 	err := app.RespBodyTo(&result)
 	assert.Error(t, err)
@@ -367,11 +370,11 @@ func TestGetStatus(t *testing.T) {
 		stdResult ApplicationStatus
 	}{
 		{
-			app:       Application{Status: PreApplying},
+			app:       Application{Status: PreApplying, mu: &sync.RWMutex{}},
 			stdResult: PreApplying,
 		},
 		{
-			app:       Application{Status: Completed},
+			app:       Application{Status: Completed, mu: &sync.RWMutex{}},
 			stdResult: Completed,
 		},
 	}
@@ -520,6 +523,7 @@ func TestCancel(t *testing.T) {
 	app := Application{
 		ctx:    ctx,
 		cancel: cancel,
+		mu:     &sync.RWMutex{},
 	}
 
 	// Verify canceling works when cancel function is provided
@@ -534,6 +538,7 @@ func TestCancel(t *testing.T) {
 	// Test case 2: Edge case - application with nil cancel function
 	app = Application{
 		cancel: nil,
+		mu:     &sync.RWMutex{},
 	}
 	app.Cancel()
 }
@@ -546,6 +551,7 @@ func TestReset(t *testing.T) {
 		Reason:   "some reason",
 		RespBody: []byte(`{"some":"data"}`),
 		Status:   Completed,
+		mu:       &sync.RWMutex{},
 	}
 
 	app.Reset()
@@ -573,6 +579,7 @@ func TestReset(t *testing.T) {
 func TestAddAndClose(t *testing.T) {
 	app := Application{
 		countLock: &sync.Mutex{},
+		mu:        &sync.RWMutex{},
 		count:     1, // Initial count
 	}
 
@@ -628,6 +635,7 @@ func TestWait(t *testing.T) {
 	app := Application{
 		ctx:    ctx,
 		cancel: cancel,
+		mu:     &sync.RWMutex{},
 	}
 
 	// Cancel the context in a goroutine to unblock Wait
@@ -649,13 +657,14 @@ func TestWait(t *testing.T) {
 	// Test case 2: Edge case - application with nil context
 	app = Application{
 		ctx: nil,
+		mu:  &sync.RWMutex{},
 	}
 	// Should not block or panic when context is nil
 	app.Wait()
 }
 
 func TestSetStatusGetStatus(t *testing.T) {
-	app := &Application{}
+	app := &Application{mu: &sync.RWMutex{}}
 	for _, s := range []ApplicationStatus{PreApplying, InApplying, Approved, Rejected, Failed, Completed} {
 		app.SetStatus(s)
 		assert.Equal(t, s, app.GetStatus())
@@ -663,7 +672,7 @@ func TestSetStatusGetStatus(t *testing.T) {
 }
 
 func TestSetReasonGetReason(t *testing.T) {
-	app := &Application{}
+	app := &Application{mu: &sync.RWMutex{}}
 	app.SetReason("test reason")
 	assert.Equal(t, "test reason", app.GetReason())
 	app.SetReason("")
@@ -671,14 +680,14 @@ func TestSetReasonGetReason(t *testing.T) {
 }
 
 func TestGetError(t *testing.T) {
-	app := &Application{}
+	app := &Application{mu: &sync.RWMutex{}}
 	got := app.GetError()
 	// Default zero value - StatusError should match
 	assert.Equal(t, app.Error, got)
 }
 
 func TestUpdateFromResponse(t *testing.T) {
-	app := &Application{}
+	app := &Application{mu: &sync.RWMutex{}}
 	resp := &Application{
 		Status:   Approved,
 		Reason:   "ok",
@@ -705,6 +714,7 @@ func TestConcurrentStatusAccess(t *testing.T) {
 		ctx:       ctx,
 		cancel:    cancel,
 		countLock: &sync.Mutex{},
+		mu:        &sync.RWMutex{},
 		Status:    PreApplying,
 	}
 
@@ -756,7 +766,7 @@ func TestConcurrentStatusAccess(t *testing.T) {
 }
 
 func TestTryStartApplying(t *testing.T) {
-	app := &Application{Status: PreApplying}
+	app := &Application{Status: PreApplying, mu: &sync.RWMutex{}}
 	assert.True(t, app.TryStartApplying())
 	assert.Equal(t, InApplying, app.GetStatus())
 
@@ -775,6 +785,7 @@ func TestTryResetAndStartApplying(t *testing.T) {
 		Status:   Completed,
 		Reason:   "old reason",
 		RespBody: []byte("old body"),
+		mu:       &sync.RWMutex{},
 	}
 
 	assert.True(t, app.TryResetAndStartApplying())

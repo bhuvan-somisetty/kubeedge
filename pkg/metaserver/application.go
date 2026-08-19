@@ -22,9 +22,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"sync"
-	"sync/atomic"
 	"time"
-	"unsafe"
 
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metainternalversion "k8s.io/apimachinery/pkg/apis/meta/internalversion"
@@ -72,37 +70,33 @@ type Application struct {
 	Timestamp time.Time
 }
 
-func (a *Application) ensureInit() {
-	if a.mu == nil {
-		newMu := &sync.RWMutex{}
-		atomic.CompareAndSwapPointer((*unsafe.Pointer)(unsafe.Pointer(&a.mu)), nil, unsafe.Pointer(newMu))
-	}
-	if a.countLock == nil {
-		newLock := &sync.Mutex{}
-		atomic.CompareAndSwapPointer((*unsafe.Pointer)(unsafe.Pointer(&a.countLock)), nil, unsafe.Pointer(newLock))
-	}
-}
-
+// lock, unlock, rLock, and rUnlock require mu to already be initialized.
+// Applications must be constructed via NewApplication, MsgToApplication, or
+// MsgToApplications, all of which initialize mu and countLock explicitly.
 func (a *Application) lock() {
-	a.ensureInit()
 	a.mu.Lock()
 }
 
 func (a *Application) unlock() {
-	if a.mu != nil {
-		a.mu.Unlock()
-	}
+	a.mu.Unlock()
 }
 
 func (a *Application) rLock() {
-	a.ensureInit()
 	a.mu.RLock()
 }
 
 func (a *Application) rUnlock() {
-	if a.mu != nil {
-		a.mu.RUnlock()
-	}
+	a.mu.RUnlock()
+}
+
+// NewApplicationForTest builds an Application for tests outside this package
+// that need to construct one via a struct literal, with mu and countLock
+// initialized. Production code must use NewApplication, MsgToApplication, or
+// MsgToApplications instead.
+func NewApplicationForTest(a Application) *Application {
+	a.mu = &sync.RWMutex{}
+	a.countLock = &sync.Mutex{}
+	return &a
 }
 
 func NewApplication(ctx context.Context, key string, verb ApplicationVerb, nodename, subresource string, option interface{}, reqBody interface{}) (*Application, error) {
@@ -315,14 +309,12 @@ func (a *Application) Reset() {
 }
 
 func (a *Application) Add() {
-	a.ensureInit()
 	a.countLock.Lock()
 	a.count++
 	a.countLock.Unlock()
 }
 
 func (a *Application) getCount() uint64 {
-	a.ensureInit()
 	a.countLock.Lock()
 	c := a.count
 	a.countLock.Unlock()
@@ -331,7 +323,6 @@ func (a *Application) getCount() uint64 {
 
 // Close must be called when applicant no longer using application
 func (a *Application) Close() {
-	a.ensureInit()
 	a.countLock.Lock()
 	defer a.countLock.Unlock()
 	if a.count == 0 {
@@ -348,7 +339,6 @@ func (a *Application) Close() {
 }
 
 func (a *Application) LastCloseTime() time.Time {
-	a.ensureInit()
 	a.countLock.Lock()
 	defer a.countLock.Unlock()
 	if a.count == 0 && !a.Timestamp.IsZero() {
